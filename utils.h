@@ -3,6 +3,12 @@
 #include <cmath>
 #include <cstdio>
 
+int divUp(int a, int b)
+{
+    return (a + b - 1) / b;
+}
+
+
 constexpr double MAX_ERROR = 0.01;
 constexpr int NUM_PRINTS = 20;
 

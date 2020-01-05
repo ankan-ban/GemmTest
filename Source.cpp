@@ -4,6 +4,9 @@
 #include "d3dx12.h"
 #include "utils.h"
 
+#include "shared.h"
+#include "shaders.h"
+
 #define checkResult(ans) { _checkResult((ans), __FILE__, __LINE__); }
 inline void _checkResult(HRESULT hr, const char* file, int line) {
     if (hr != S_OK) {
@@ -270,7 +273,84 @@ public:
     }
 };
 
+
+class ShaderWrapper {
+private:
+    // common for all shaders
+    ID3D12RootSignature* m_pRootSign;
+
+    ID3D12PipelineState* m_pMatMulState;
+public:
+    void init(ID3D12Device* pDevice, bool fp16)
+    {
+        // 1. Create root signature - common for all shaders
+
+        // 5 slots
+        // slot 0 to 3 -> root UAV slots 0 to 3 (all in space 0)
+        // slot 4      -> root constants (16 constants - should be enough)
+
+        D3D12_ROOT_PARAMETER rootParameter[5];
+        for (int i = 0; i < 4; i++) {
+            rootParameter[i].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+            rootParameter[i].Descriptor.RegisterSpace = 0;
+            rootParameter[i].Descriptor.ShaderRegister = i;
+            rootParameter[i].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+        }
+
+        rootParameter[4].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+        rootParameter[4].Constants.RegisterSpace = 0;
+        rootParameter[4].Constants.ShaderRegister = 0;
+        rootParameter[4].Constants.Num32BitValues = 16;
+        rootParameter[4].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
+        D3D12_ROOT_SIGNATURE_DESC rootSigDesc = { 5, rootParameter, 0, NULL,
+                                                 D3D12_ROOT_SIGNATURE_FLAG_NONE };
+
+        ID3DBlob* pSerializedLayout = NULL;
+        D3D12SerializeRootSignature(&rootSigDesc, D3D_ROOT_SIGNATURE_VERSION_1,
+            &pSerializedLayout, NULL);
+
+        checkResult(pDevice->CreateRootSignature(
+            1, pSerializedLayout->GetBufferPointer(),
+            pSerializedLayout->GetBufferSize(), IID_PPV_ARGS(&m_pRootSign)));
+
+        pSerializedLayout->Release();
+
+        D3D12_COMPUTE_PIPELINE_STATE_DESC stateDesc = {};
+        stateDesc.pRootSignature = m_pRootSign;
+        stateDesc.CS = { fp16 ? g_MatrixMul_Fp16 : g_MatrixMul_Fp32,
+                        fp16 ? sizeof(g_MatrixMul_Fp16) : sizeof(g_MatrixMul_Fp32) };
+        checkResult(pDevice->CreateComputePipelineState(
+            &stateDesc, IID_PPV_ARGS(&m_pMatMulState)));
+    }
+
+    void destroy()
+    {
+        m_pMatMulState->Release();
+        m_pRootSign->Release();
+    }
+
+    void MatrixMul(int M, int N, int K, int batch, ID3D12GraphicsCommandList *pCL, D3D12Alloc *pA, D3D12Alloc *pB, D3D12Alloc *pC)
+    {
+        int Consts[] = { M, N, K, batch };
+        pCL->SetComputeRootSignature(m_pRootSign);
+        pCL->SetPipelineState(m_pMatMulState);
+        pCL->SetComputeRootUnorderedAccessView(0, pA->gpuVA);
+        pCL->SetComputeRootUnorderedAccessView(1, pB->gpuVA);
+        pCL->SetComputeRootUnorderedAccessView(2, pC->gpuVA);
+        pCL->SetComputeRoot32BitConstants(4, 4, &Consts, 0);
+
+        // TODO: remove hardcoding of 64
+        int blocksX = divUp(N, ELEMENTS_PER_BLOCK_X);
+        int blocksY = divUp(M, ELEMENTS_PER_BLOCK_Y);
+        int blocksZ = batch;
+
+        pCL->Dispatch(blocksX, blocksY, blocksZ);
+    }
+};
+
 D3d12Wrapper g_DXWrapper;
+ShaderWrapper g_ShaderWrapper;
 
 // get descriptor for row-major matrix (or batch of 'n' matrices)
 static void getTensorDesc(TensorDesc* outDesc, int n, int rows, int cols, bool fp16 = true) 
@@ -296,11 +376,14 @@ static void getTensorDesc(TensorDesc* outDesc, int n, int rows, int cols, bool f
 
 int main()
 {
+    const bool useMetacommands = false;
+    const bool useFp16 = true;
+
     const int gpuToUse = 0;
     g_DXWrapper.init(gpuToUse);
+    g_ShaderWrapper.init(g_DXWrapper.getDevice(), useFp16);
 
-    const int useFp16 = true;
-    const int M = 1024;
+    const int M = 256*4;
     const int N = 256;
     const int K = 256;
     const int batch = 36;
@@ -367,8 +450,11 @@ int main()
     {
         g_DXWrapper.beginTimer();
 
-        for (int j=0;j< iterPerLoop;j++)
-            g_DXWrapper.getCL()->ExecuteMetaCommand(pMetacommand, &execDesc, sizeof(execDesc));
+        for (int j = 0; j < iterPerLoop; j++)
+            if (useMetacommands)
+                g_DXWrapper.getCL()->ExecuteMetaCommand(pMetacommand, &execDesc, sizeof(execDesc));
+            else
+                g_ShaderWrapper.MatrixMul(M, N, K, batch, g_DXWrapper.getCL(), &A, &B, &Out);
 
         g_DXWrapper.endTimer();
 
