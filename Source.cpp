@@ -6,6 +6,10 @@
 
 #include "shared.h"
 #include "shaders.h"
+#include <chrono>
+#include <thread>
+
+const bool useFp16 = true;
 
 #define checkResult(ans) { _checkResult((ans), __FILE__, __LINE__); }
 inline void _checkResult(HRESULT hr, const char* file, int line) {
@@ -73,7 +77,7 @@ public:
         heapDesc.NumDescriptors = MAX_DESCS;
         checkResult(m_pDevice->CreateDescriptorHeap(&heapDesc, IID_PPV_ARGS(&m_pDescHeap)));
         nextFreeDescHeapSlot = 0;
-
+        m_pCL->SetDescriptorHeaps(1, &m_pDescHeap);
         m_fenceVal = 0ull;
         checkResult(m_pDevice->CreateFence(m_fenceVal, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&m_pFence)));
 
@@ -146,10 +150,14 @@ public:
 
             D3D12_UNORDERED_ACCESS_VIEW_DESC uavDesc = {};
             uavDesc.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
-            uavDesc.Format = DXGI_FORMAT_R32_TYPELESS;
-            uavDesc.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
             uavDesc.Buffer.FirstElement = 0;
-            uavDesc.Buffer.NumElements = size / 4;
+#if USE_VECTOR_IO == 1
+            uavDesc.Format = useFp16 ? DXGI_FORMAT_R16G16B16A16_FLOAT : DXGI_FORMAT_R32G32B32A32_FLOAT;
+            uavDesc.Buffer.NumElements = useFp16 ? size / 8 : size / 16;
+#else
+            uavDesc.Format = useFp16 ? DXGI_FORMAT_R16_FLOAT : DXGI_FORMAT_R32_FLOAT;
+            uavDesc.Buffer.NumElements = useFp16 ? size / 2 : size / 4;
+#endif
 
             m_pDevice->CreateUnorderedAccessView(pAlloc->pResource, nullptr, &uavDesc,
                 cpuDescHandle);
@@ -170,6 +178,7 @@ public:
 
         m_pCA->Reset();
         m_pCL->Reset(m_pCA, NULL);
+        m_pCL->SetDescriptorHeaps(1, &m_pDescHeap);
     }
 
     ID3D12Device5* getDevice() { return m_pDevice; }
@@ -286,14 +295,27 @@ public:
         // 1. Create root signature - common for all shaders
 
         // 5 slots
-        // slot 0 to 3 -> root UAV slots 0 to 3 (all in space 0)
+        // slot 0 to 3 -> root UAV slots 0 to 3 (all in space 0), or desc heap uavs
         // slot 4      -> root constants (16 constants - should be enough)
 
-        D3D12_ROOT_PARAMETER rootParameter[5];
+        D3D12_DESCRIPTOR_RANGE descRange[4] = {};
+        D3D12_ROOT_PARAMETER rootParameter[5] = {};
         for (int i = 0; i < 4; i++) {
+#if USE_TYPED_BUFFERS == 1
+            descRange[i].BaseShaderRegister = i;
+            descRange[i].NumDescriptors = 1;
+            descRange[i].OffsetInDescriptorsFromTableStart = 0;
+            descRange[i].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+            descRange[i].RegisterSpace = 0;
+
+            rootParameter[i].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+            rootParameter[i].DescriptorTable.NumDescriptorRanges = 1;
+            rootParameter[i].DescriptorTable.pDescriptorRanges = &descRange[i];
+#else
             rootParameter[i].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
             rootParameter[i].Descriptor.RegisterSpace = 0;
             rootParameter[i].Descriptor.ShaderRegister = i;
+#endif
             rootParameter[i].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
         }
 
@@ -335,9 +357,15 @@ public:
         int Consts[] = { M, N, K, batch };
         pCL->SetComputeRootSignature(m_pRootSign);
         pCL->SetPipelineState(m_pMatMulState);
+#if USE_TYPED_BUFFERS == 1
+        pCL->SetComputeRootDescriptorTable(0, pA->descHandle);
+        pCL->SetComputeRootDescriptorTable(1, pB->descHandle);
+        pCL->SetComputeRootDescriptorTable(2, pC->descHandle);
+#else
         pCL->SetComputeRootUnorderedAccessView(0, pA->gpuVA);
         pCL->SetComputeRootUnorderedAccessView(1, pB->gpuVA);
         pCL->SetComputeRootUnorderedAccessView(2, pC->gpuVA);
+#endif
         pCL->SetComputeRoot32BitConstants(4, 4, &Consts, 0);
 
         // TODO: remove hardcoding of 64
@@ -373,11 +401,12 @@ static void getTensorDesc(TensorDesc* outDesc, int n, int rows, int cols, bool f
     outDesc->PhysicalSizeInElements = n * rows * cols;
 }
 
+#define ENABLE_METACOMMANDS 0
 
 int main()
 {
-    const bool useMetacommands = false;
-    const bool useFp16 = true;
+    auto start = std::chrono::system_clock::now();
+    const bool useMetacommands = true;
 
     const int gpuToUse = 0;
     g_DXWrapper.init(gpuToUse);
@@ -389,10 +418,15 @@ int main()
     const int batch = 36;
     const int elementSize = useFp16 ? sizeof(uint16_t) : sizeof(float);
 
-    void *cpuA = malloc(M*K*batch*elementSize);
-    void *cpuB = malloc(K*N*batch*elementSize);
-    void *cpuOut = malloc(M*N*batch*elementSize);
-    void *cpuRef = malloc(M*N*batch*elementSize);
+    size_t ASize = M * K * batch * elementSize;
+    size_t BSize = K * N * batch * elementSize;
+    size_t OutSize = M * N * batch * elementSize;
+
+
+    void *cpuA = malloc(ASize);
+    void *cpuB = malloc(BSize);
+    void *cpuOut = malloc(OutSize);
+    void *cpuRef = malloc(OutSize);
 
     fillRandomArray(cpuA, M*K*batch, useFp16);
     fillRandomArray(cpuB, K*N*batch, useFp16);
@@ -407,24 +441,27 @@ int main()
     createDesc.Beta = 0.0;
     createDesc.Precision = useFp16 ? 1 : 0; // 0 - fp32, 1 - fp16
 
-    ID3D12MetaCommand *pMetacommand = nullptr;
-    checkResult(g_DXWrapper.getDevice()->CreateMetaCommand(GemmGuid, 1, &createDesc, sizeof(createDesc), IID_PPV_ARGS(&pMetacommand)));
-
-    size_t ASize = pMetacommand->GetRequiredParameterResourceSize(D3D12_META_COMMAND_PARAMETER_STAGE_EXECUTION, 0);
-    size_t BSize = pMetacommand->GetRequiredParameterResourceSize(D3D12_META_COMMAND_PARAMETER_STAGE_EXECUTION, 1);
-    size_t OutSize = pMetacommand->GetRequiredParameterResourceSize(D3D12_META_COMMAND_PARAMETER_STAGE_EXECUTION, 3);
-
-    size_t persistentSize = pMetacommand->GetRequiredParameterResourceSize(D3D12_META_COMMAND_PARAMETER_STAGE_EXECUTION, 4);
-    size_t tempSize = pMetacommand->GetRequiredParameterResourceSize(D3D12_META_COMMAND_PARAMETER_STAGE_EXECUTION, 5);
-    printf("\nPersistent size: %llu, temp size: %llu\n", persistentSize, tempSize);
-
     D3D12Alloc persistent = {}, temperory = {}, A = {}, B = {}, Out = {};
+
     g_DXWrapper.createAlloc(ASize, D3D12_HEAP_TYPE_DEFAULT, &A);
     g_DXWrapper.createAlloc(BSize, D3D12_HEAP_TYPE_DEFAULT, &B);
     g_DXWrapper.createAlloc(OutSize, D3D12_HEAP_TYPE_DEFAULT, &Out);
 
     g_DXWrapper.uploadData(&A, cpuA, ASize);
     g_DXWrapper.uploadData(&B, cpuB, BSize);
+
+
+#if ENABLE_METACOMMANDS == 1
+    ID3D12MetaCommand* pMetacommand = nullptr;
+    checkResult(g_DXWrapper.getDevice()->CreateMetaCommand(GemmGuid, 1, &createDesc, sizeof(createDesc), IID_PPV_ARGS(&pMetacommand)));
+
+    //size_t ASize = pMetacommand->GetRequiredParameterResourceSize(D3D12_META_COMMAND_PARAMETER_STAGE_EXECUTION, 0);
+    //size_t BSize = pMetacommand->GetRequiredParameterResourceSize(D3D12_META_COMMAND_PARAMETER_STAGE_EXECUTION, 1);
+    //size_t OutSize = pMetacommand->GetRequiredParameterResourceSize(D3D12_META_COMMAND_PARAMETER_STAGE_EXECUTION, 3);
+
+    size_t persistentSize = pMetacommand->GetRequiredParameterResourceSize(D3D12_META_COMMAND_PARAMETER_STAGE_EXECUTION, 4);
+    size_t tempSize = pMetacommand->GetRequiredParameterResourceSize(D3D12_META_COMMAND_PARAMETER_STAGE_EXECUTION, 5);
+    printf("\nPersistent size: %llu, temp size: %llu\n", persistentSize, tempSize);
 
     if (persistentSize)
         g_DXWrapper.createAlloc(persistentSize, D3D12_HEAP_TYPE_DEFAULT, &persistent);  // huge alloc - driver bug!
@@ -442,23 +479,35 @@ int main()
     execDesc.OutputResource = Out.descHandle;
     execDesc.PersistentResource = persistent.descHandle;
     execDesc.TemporaryResource = temperory.descHandle;
+#endif
 
     int loops = 10;
     int iterPerLoop = 100;
+
+    double  loopTime = 0;
 
     for (int i = 0; i < loops; i++)
     {
         g_DXWrapper.beginTimer();
 
+        auto loopstart = std::chrono::system_clock::now();
+
         for (int j = 0; j < iterPerLoop; j++)
+#if ENABLE_METACOMMANDS == 1
             if (useMetacommands)
                 g_DXWrapper.getCL()->ExecuteMetaCommand(pMetacommand, &execDesc, sizeof(execDesc));
             else
+#endif
                 g_ShaderWrapper.MatrixMul(M, N, K, batch, g_DXWrapper.getCL(), &A, &B, &Out);
 
         g_DXWrapper.endTimer();
 
         g_DXWrapper.flushAndWait();
+        auto loopend = std::chrono::system_clock::now();
+        std::chrono::duration<double> elapsed_seconds = loopend - loopstart;
+        loopTime = (elapsed_seconds).count();
+
+
         double time = g_DXWrapper.getTimeInSeconds();
         double flops = (double(M) * N * K * 2 * iterPerLoop * batch) / time;
         double bps = iterPerLoop * batch * (double(M)*N + M * K + K * N) * elementSize / time;
@@ -469,11 +518,20 @@ int main()
     matrixMulCPU(M, N, K, batch, cpuRef, cpuA, cpuB, useFp16);
     compareResults(cpuOut, cpuRef, batch*M*N, useFp16);
 
+    auto end = std::chrono::system_clock::now();
+    std::chrono::duration<double> elapsed_seconds = end - start;
+    double  time = (elapsed_seconds).count();
+
+    printf("\n\nTotal CPU time: %g seconds, Metacommand exec time: %g seconds\n", time, loopTime);
+
+
+#if ENABLE_METACOMMANDS == 1
     if(persistentSize)
         g_DXWrapper.destroyAlloc(&persistent);
 
     if (tempSize)
         g_DXWrapper.destroyAlloc(&temperory);
+#endif
 
     g_DXWrapper.destroyAlloc(&A);
     g_DXWrapper.destroyAlloc(&B);

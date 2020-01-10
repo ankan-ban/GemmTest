@@ -8,3 +8,8 @@
 #define ELEMENTS_PER_BLOCK_Y (ELEMENTS_PER_THREAD_Y*BLOCK_HEIGHT)
 
 #define SHARED_MEM_K_CHUNK 16
+
+#define USE_TYPED_BUFFERS 1
+
+// 4 elements at a time
+#define USE_VECTOR_IO 1
