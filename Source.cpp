@@ -441,7 +441,7 @@ int main()
     createDesc.Beta = 0.0;
     createDesc.Precision = useFp16 ? 1 : 0; // 0 - fp32, 1 - fp16
 
-    D3D12Alloc persistent = {}, temperory = {}, A = {}, B = {}, Out = {};
+    D3D12Alloc persistent = {}, temporary = {}, A = {}, B = {}, Out = {};
 
     g_DXWrapper.createAlloc(ASize, D3D12_HEAP_TYPE_DEFAULT, &A);
     g_DXWrapper.createAlloc(BSize, D3D12_HEAP_TYPE_DEFAULT, &B);
@@ -466,7 +466,7 @@ int main()
     if (persistentSize)
         g_DXWrapper.createAlloc(persistentSize, D3D12_HEAP_TYPE_DEFAULT, &persistent);  // huge alloc - driver bug!
     if (tempSize)
-        g_DXWrapper.createAlloc(tempSize, D3D12_HEAP_TYPE_DEFAULT, &persistent);
+        g_DXWrapper.createAlloc(tempSize, D3D12_HEAP_TYPE_DEFAULT, &temporary);
 
     GemmInitDesc initDesc = {};
     initDesc.PersistentResource = persistent.descHandle;
@@ -478,7 +478,7 @@ int main()
     execDesc.BResource = B.descHandle;
     execDesc.OutputResource = Out.descHandle;
     execDesc.PersistentResource = persistent.descHandle;
-    execDesc.TemporaryResource = temperory.descHandle;
+    execDesc.TemporaryResource = temporary.descHandle;
 #endif
 
     int loops = 10;
@@ -530,7 +530,7 @@ int main()
         g_DXWrapper.destroyAlloc(&persistent);
 
     if (tempSize)
-        g_DXWrapper.destroyAlloc(&temperory);
+        g_DXWrapper.destroyAlloc(&temporary);
 #endif
 
     g_DXWrapper.destroyAlloc(&A);
